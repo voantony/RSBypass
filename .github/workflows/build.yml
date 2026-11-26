@@ -1,0 +1,76 @@
+name: Build libRSBypass
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pattern scan and path selection
+        run: |
+          gcc -Wall -Werror -o pattern_test test/pattern_test.c
+          ./pattern_test
+          bash test/test_paths.sh
+
+  dylib:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build x86_64 libRSBypass.dylib
+        run: |
+          set -euo pipefail
+          xcodebuild -project RSBypass.xcodeproj -scheme RSBypass -configuration Release \
+            -derivedDataPath build \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO \
+            MACOSX_DEPLOYMENT_TARGET=10.13 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" ENABLE_HARDENED_RUNTIME=NO \
+            OTHER_CFLAGS=-fno-stack-check
+          dylib=""
+          for candidate in build/Build/Products/Release/*.dylib; do
+            if [ -f "$candidate" ]; then
+              dylib=$candidate
+              break
+            fi
+          done
+          test -n "$dylib"
+          echo "Built $dylib"
+          file "$dylib"
+          lipo -info "$dylib"
+          file "$dylib" | grep -q x86_64
+          if file "$dylib" | grep -q arm64; then
+            echo "expected a thin x86_64 dylib, also found arm64"
+            exit 1
+          fi
+          lipo -info "$dylib" | grep -q x86_64
+          if nm -u "$dylib" | grep -q chkstk; then
+            echo "dylib references chkstk, which is missing on older macOS"
+            nm -u "$dylib" | grep chkstk
+            exit 1
+          fi
+          vtool -show-build "$dylib" | tee /tmp/vtool.txt
+          # Deployment target 10.13 is recorded as LC_VERSION_MIN_MACOSX.
+          # Newer targets use LC_BUILD_VERSION's minos field.
+          grep -E -q 'minos 10\.13|version 10\.13' /tmp/vtool.txt
+          otool -D "$dylib" | grep -q '@executable_path/libRSBypass.dylib'
+          codesign --force --sign - "$dylib"
+          codesign -dv "$dylib" 2>&1 | tee /tmp/codesign.txt
+          grep -E -q 'Signature=adhoc|flags=0x2\(adhoc\)' /tmp/codesign.txt
+          mkdir -p dist
+          cp "$dylib" dist/libRSBypass.dylib
+          cp insert_dylib dist/insert_dylib
+          cp RSBypass/RUN_PATCH_RS.command dist/RUN_PATCH_RS.command
+          chmod +x dist/insert_dylib dist/RUN_PATCH_RS.command
+          codesign --force --sign - dist/insert_dylib
+          bash -n dist/RUN_PATCH_RS.command
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RSBypass-macos-x86_64
+          path: dist/
+          if-no-files-found: error

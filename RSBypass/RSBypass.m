@@ -1,170 +1,200 @@
+#include <errno.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 
 #import "RSBypass.h"
+#include "scan.h"
 
-// Added for find_remote_image_load_address
-#include <mach-o/dyld_images.h>
-#include <mach-o/dyld.h>
-#include <mach/mach_vm.h>
+/* Rocksmith 2014 is an x86_64 process, including under Rosetta 2.
+ * _dyld_get_image_header() is the supported way to find that image.
+ * task_info(TASK_DYLD_INFO) plus dyld_all_image_infos->aotInfoArray is not:
+ * aotInfoArray is the Rosetta translation table, it is often NULL, and on
+ * current dyld the legacy infoArray can be NULL as well. Dereferencing it
+ * crashed the game (segfault on launch). The old scan length 0x013CE9BC1
+ * was also one nibble too long and walked off the mapped image.
+ */
 
-//function prototype definition
-uint64_t find_image_load_address(void);
+static int rs_make_writable(void *addr, size_t len) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start;
+    uintptr_t end;
+    vm_address_t region;
+    vm_size_t size;
+    kern_return_t kr;
 
+    if (page < 4096)
+        page = 4096;
+    start = (uintptr_t)addr & ~((uintptr_t)page - 1);
+    end = ((uintptr_t)addr + len + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    region = (vm_address_t)start;
+    size = (vm_size_t)(end - start);
 
-typedef uint64_t DWORD;
-typedef int8_t  BYTE;
+    /* VM_PROT_COPY detaches a signed page so it can be written.
+     * W^X means the page must not be executable at the same time.
+     */
+    kr = vm_protect(mach_task_self(), region, size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr == KERN_SUCCESS)
+        return 1;
+    if (mprotect((void *)start, (size_t)size, PROT_READ | PROT_WRITE) == 0)
+        return 1;
 
-// Mac OS 64 Bit
-// These numbers come from otool -lv
-// const DWORD  segStart = 0x001000;
-// const size_t segLen   = 0x013ce000;
-const size_t segLen   = 0x013CE9BC1;
-
-// Could be made more general to bypass all signature checks
-// including ini files...
-// For the time being only patches the sig verif of sng files
-// const char*  hint     = "\x0f\x84\xc6\x0a\x00\x00";
-// const char*  hint     = "\x84\xdb\x0f\x84\xde\x0a\x00\x00";
-const char*  hint     = "\x45\x84\xF6\x0F\x84\xCF\x0A\x00\x00";
-
-
-bool bCompare(const BYTE* pData, const BYTE * bMask, const char* szMask) {
-    for (; *szMask; ++szMask, ++pData, ++bMask)
-        if (*szMask == 'x' && *pData != *bMask)
-            return 0;
-    return (*szMask) == 0;
+    NSLog(@"RSBypass: cannot make %p (%lu bytes) writable: vm_protect %d, mprotect %s",
+          addr, (unsigned long)len, kr, strerror(errno));
+    return 0;
 }
 
-void* FindPattern(DWORD dwAddress, size_t dwLen, BYTE* bMask, char* szMask) {
-    for (DWORD i = 0; i < dwLen; i++)
-        if (bCompare((BYTE*)(dwAddress + i), bMask, szMask))
-            return (void*)(dwAddress + i);
-    return NULL;
+static void rs_make_executable(void *addr, size_t len) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start;
+    uintptr_t end;
+    vm_size_t size;
+
+    if (page < 4096)
+        page = 4096;
+    start = (uintptr_t)addr & ~((uintptr_t)page - 1);
+    end = ((uintptr_t)addr + len + (uintptr_t)page - 1) & ~((uintptr_t)page - 1);
+    size = (vm_size_t)(end - start);
+
+    if (mprotect((void *)start, (size_t)size, PROT_READ | PROT_EXEC) != 0) {
+        NSLog(@"RSBypass: mprotect RX failed (%s); trying vm_protect", strerror(errno));
+        vm_protect(mach_task_self(), (vm_address_t)start, size, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+    }
+}
+
+static int rs_patch_at(uint8_t *site, size_t len) {
+    if (!rs_make_writable(site, len))
+        return 0;
+    NSLog(@"RSBypass: bypassing signature check at %p (%lu bytes)", site, (unsigned long)len);
+    memset(site, 0x90, len);
+    msync(site, len, MS_SYNC);
+    rs_make_executable(site, len);
+    return 1;
+}
+
+static const struct mach_header_64 *rs_game_header(uint32_t *index_out) {
+    uint32_t count = _dyld_image_count();
+    uint32_t i;
+    const struct mach_header_64 *fallback = NULL;
+    uint32_t fallback_index = 0;
+
+    for (i = 0; i < count; i++) {
+        const struct mach_header *header = _dyld_get_image_header(i);
+        const char *name;
+
+        if (header == NULL || header->magic != MH_MAGIC_64)
+            continue;
+        if (fallback == NULL) {
+            fallback = (const struct mach_header_64 *)header;
+            fallback_index = i;
+        }
+        name = _dyld_get_image_name(i);
+        if (name != NULL && strstr(name, "Rocksmith2014") != NULL &&
+            strstr(name, "RSBypass") == NULL) {
+            NSLog(@"RSBypass: game image %s", name);
+            if (index_out)
+                *index_out = i;
+            return (const struct mach_header_64 *)header;
+        }
+    }
+
+    if (fallback != NULL) {
+        const char *name = _dyld_get_image_name(fallback_index);
+        NSLog(@"RSBypass: Rocksmith2014 image not named; scanning %s",
+              name != NULL ? name : "(unknown)");
+        if (index_out)
+            *index_out = fallback_index;
+    }
+    return fallback;
+}
+
+static int rs_scan_image(const struct mach_header_64 *header, intptr_t slide,
+                         const uint8_t *pat, size_t pat_len) {
+    const uint8_t *cmds;
+    const uint8_t *cmds_end;
+    uint32_t i;
+
+    if (header->sizeofcmds == 0 || header->sizeofcmds > (1u << 20) || header->ncmds > 4096)
+        return 0;
+
+    cmds = (const uint8_t *)header + sizeof(*header);
+    cmds_end = cmds + header->sizeofcmds;
+
+    for (i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc;
+        const struct segment_command_64 *seg;
+        const uint8_t *start;
+        const uint8_t *found;
+
+        if (cmds + sizeof(struct load_command) > cmds_end)
+            break;
+        lc = (const struct load_command *)cmds;
+        if (lc->cmdsize < sizeof(struct load_command) || cmds + lc->cmdsize > cmds_end)
+            break;
+
+        if (lc->cmd == LC_SEGMENT_64) {
+            seg = (const struct segment_command_64 *)lc;
+            /* Executable segments only. filesize is the mapped initialized
+             * range; vmsize can extend into unmapped zero-fill.
+             */
+            if ((seg->initprot & VM_PROT_EXECUTE) != 0 &&
+                seg->filesize >= pat_len &&
+                seg->filesize <= (96ull << 20)) {
+                start = (const uint8_t *)((uintptr_t)seg->vmaddr + (uintptr_t)slide);
+                found = rs_find_bytes(start, (size_t)seg->filesize, pat, pat_len);
+                if (found != NULL)
+                    return rs_patch_at((uint8_t *)found, pat_len);
+            }
+        }
+        cmds += lc->cmdsize;
+    }
+    return 0;
+}
+
+static int rs_try_patch(void) {
+    uint32_t index = 0;
+    const struct mach_header_64 *header = rs_game_header(&index);
+    intptr_t slide;
+
+    if (header == NULL) {
+        NSLog(@"RSBypass: no 64-bit image to scan");
+        return 0;
+    }
+
+    slide = _dyld_get_image_vmaddr_slide(index);
+    NSLog(@"RSBypass: header %p slide %ld", header, (long)slide);
+
+    if (rs_scan_image(header, slide, rs_pat_current, sizeof rs_pat_current)) {
+        NSLog(@"RSBypass: patched");
+        return 1;
+    }
+
+    NSLog(@"RSBypass: signature check pattern not found. The game binary may have changed.");
+    return 0;
+}
+
+static void rsbypass_apply(void) {
+    static int patched = 0;
+    if (patched)
+        return;
+    NSLog(@"RSBypass: load()");
+    if (rs_try_patch())
+        patched = 1;
 }
 
 @implementation RSBypass
-+(void)load
++ (void)load
 {
-    NSLog(@"RSBypass: load()");
-
-    uint64_t addr = find_image_load_address();
-    uint64_t segStart = addr + 0x1510;
-
-    NSLog(@"Addr=%llu", addr);
-    
-    if (addr) {
-        void* ptr = FindPattern(segStart, segLen, (BYTE*)hint, "xxxxxxxxx");
-        if (ptr) {
-            
-            long page_size = sysconf(_SC_PAGESIZE);
-            
-            void* page_start = (long)ptr & -page_size;
-            
-            NSLog(@"Attempting Removing memory protection");
-            if(mprotect(page_start, page_size, PROT_READ | PROT_WRITE) == 0){
-            	
-            NSLog(@"RSInjector: Bypassing signature check at %p", ptr);
-            memset(ptr, 0x90, 9);
-            msync(ptr, 9, MS_SYNC);
-            
-            mprotect(page_start, page_size, PROT_READ | PROT_EXEC);
-            }else{
-                NSLog(@"Memory Operation failed: \nmprotect: %s\n", strerror(errno));
-            }
-        }
-    }
+    rsbypass_apply();
 }
-
-
-//unsigned long find_remote_image_load_address(mach_port_t task) {
-//    unsigned long addr = 0;
-//    kern_return_t kret;
-//    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-//    struct task_dyld_info info;
-//    struct dyld_all_image_infos* all_image_infos;
-//    struct dyld_image_info* image_info;
-//    pointer_t buffer_pointer;
-//    uint32_t sz;
-//
-//    kret = task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &count);
-//    if (kret != KERN_SUCCESS) {
-//        printf("task_info() failed, error %d - %s\n", kret, mach_error_string(kret));
-//        exit(10);
-//    }
-//
-//    kret = vm_read(task, info.all_image_info_addr, info.all_image_info_size, &buffer_pointer,  &sz);
-//    if (kret != KERN_SUCCESS) {
-//        printf("vm_read() failed, error %d -> %s\n", kret, mach_error_string(kret));
-//        exit(11);
-//    }
-//    all_image_infos = (struct dyld_all_image_infos*)malloc(sz);
-//    if (all_image_infos == NULL) {
-//        printf("malloc(0x%lx) failed", (unsigned long)sz);
-//        exit(12);
-//    }
-//    memcpy(all_image_infos, (const void*)buffer_pointer, sz);
-//
-//
-//    kret = vm_read(task, (vm_address_t)all_image_infos->infoArray, sizeof(struct dyld_image_info) * all_image_infos->infoArrayCount, &buffer_pointer,  &sz);
-//    if (kret != KERN_SUCCESS) {
-//        printf("vm_read() failed, error %d -> %s\n", kret, mach_error_string(kret));
-//        exit(13);
-//    }
-//    image_info = (struct dyld_image_info*)malloc(sz);
-//    if (image_info == NULL) {
-//        printf("malloc(0x%lx) failed", (unsigned long)sz);
-//        exit(14);
-//    }
-//    memcpy(image_info, (const void*)buffer_pointer, sz);
-//
-//    printf("image load address: %llX\n", (uint64_t)image_info->imageLoadAddress);
-//
-//    return (unsigned long)image_info->imageLoadAddress;
-//}
-
-uint64_t find_image_load_address() {
-    //uint64_t addr = 0; unused
-    kern_return_t kret;
-    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    struct task_dyld_info info;
-    struct dyld_all_image_infos* all_image_infos;
-    struct dyld_image_info* image_info;
-    mach_port_t task = mach_task_self();
-
-    kret = task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &count);
-    if (kret != KERN_SUCCESS) {
-        // printf("task_info() failed, error %d - %s\n", kret, mach_error_string(kret));
-        return 0;
-    }
-    all_image_infos = (struct dyld_all_image_infos*)info.all_image_info_addr;
-    image_info = (struct dyld_image_info*)all_image_infos->aotInfoArray;
-
-    return (uint64_t)image_info->imageLoadAddress;
-}
-
-//@implementation RSBypass
-//+(void)load
-//{
-////    NSLog(@"RSBypass: load()");
-//
-//    void* ptr = FindPattern(find_image_load_address()  + 0x1510, segLen,
-//                            (BYTE*)hint, "xxxxxxxx");
-//    if (ptr) {
-//
-//        long page_size = sysconf(_SC_PAGESIZE);
-//        void* page_start = (long)ptr & -page_size;
-//
-////        NSLog(@"Removing memory protection");
-//        mprotect(page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
-//
-////        NSLog(@"RSInjector: Bypassing signature check at %p", ptr);
-//        memset(ptr, 0x90, 8);
-//        msync(ptr, 8, MS_SYNC);
-//
-//        // Restoring memory protection
-//        mprotect(page_start, page_size, PROT_READ | PROT_EXEC);
-//
-//    }
-//}
 @end
+
+__attribute__((constructor))
+static void rsbypass_constructor(void) {
+    rsbypass_apply();
+}

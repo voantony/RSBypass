@@ -1,5 +1,7 @@
 # Legacy Support
 
+Current macOS, including Apple Silicon, should use `RSBypass/RUN_PATCH_RS.command` and the x86_64 `libRSBypass.dylib` from the build. The notes below are for the older `insert_dylib`, which was built for macOS 12 and fails on earlier systems with the stack-check error.
+
 ## Patch fails with errors
 
 ### Build errors
