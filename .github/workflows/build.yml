@@ -55,7 +55,9 @@ jobs:
             exit 1
           fi
           vtool -show-build "$dylib" | tee /tmp/vtool.txt
-          grep -q "minos 10.13" /tmp/vtool.txt
+          # Deployment target 10.13 is recorded as LC_VERSION_MIN_MACOSX.
+          # Newer targets use LC_BUILD_VERSION's minos field.
+          grep -E -q 'minos 10\.13|version 10\.13' /tmp/vtool.txt
           otool -D "$dylib" | grep -q '@executable_path/libRSBypass.dylib'
           codesign --force --sign - "$dylib"
           codesign -dv "$dylib" 2>&1 | tee /tmp/codesign.txt
